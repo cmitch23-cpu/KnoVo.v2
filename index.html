@@ -15,7 +15,6 @@
 <meta property="og:image" content="https://knovo.org/og.png" />
 <meta property="og:image:width" content="1200" />
 <meta property="og:image:height" content="630" />
-
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="KnoVo" />
 <meta name="twitter:description" content="Understand how power works where you live." />
@@ -4143,17 +4142,25 @@ function _injectPhotoIntoCard(candidateId, photoUrl) {
 }
 
 
-// ─── GOOGLE CUSTOM SEARCH — CANDIDATE PHOTO FETCHING ────────────────────────
-// Uses Google Custom Search Image API to find official candidate portraits.
-// Runs in the browser (not server-side) — makes real HTTP requests to Google.
-// Free tier: 100 queries/day. We batch requests with a small delay.
+// ─── CANDIDATE PHOTO FETCHING — Google Custom Search API ────────────────────
+// Searches for official portraits using name + office as query.
+// Strictly prefers .gov, senate.gov, house.gov, ballotpedia.org sources.
+// Falls back to initials if nothing found — no Wikipedia, no random images.
 
 var GOOG_API_KEY = 'AIzaSyByvKNG7hBoICuSpk6zdg5X95Wv7tQ6P-k';
 var GOOG_CX      = '572daf211eb334802';
 var _photoCache  = {};
-var _fetchDelay  = 0; // stagger requests to avoid rate limiting
+var _fetchDelay  = 0;
 
-// Fetch photos for all candidates currently in CANDIDATE_INDEX that lack a photo
+// Trusted official sources — in priority order
+var TRUSTED_SOURCES = [
+  'house.gov',
+  'senate.gov',
+  '.gov',
+  'ballotpedia.org',
+  'votesmart.org',
+];
+
 function fetchAllCandidatePhotos() {
   _fetchDelay = 0;
   for (var id in CANDIDATE_INDEX) {
@@ -4164,7 +4171,7 @@ function fetchAllCandidatePhotos() {
           fetchPhotoForCandidate(candidateId, candidate, race);
         }, _fetchDelay);
       })(id, c, CANDIDATE_INDEX[id].race);
-      _fetchDelay += 50; // 50ms between requests — Wikipedia has no strict rate limit
+      _fetchDelay += 100;
     }
   }
 }
@@ -4175,16 +4182,30 @@ function fetchPhotoForCandidate(candidateId, c, race) {
     return;
   }
 
-  // Build a specific search query: name + office + "official photo"
+  // Query 1: name + office, restricted to trusted official sources
   var office = (race && race.office) ? race.office.replace(/\(.*?\)/g, '').trim() : '';
-  var stateAbbr = (race && race.id) ? race.id.split('_').pop().toUpperCase() : '';
-  var query = c.name + ' ' + office + ' official portrait photo';
+  var query = '"' + c.name + '" ' + office + ' official photo';
 
+  _doImageSearch(query, candidateId, c, function(url) {
+    if (url) {
+      _saveAndApply(candidateId, c, url);
+    } else {
+      // Query 2: name only + "senator" or "representative" or "governor"
+      var fallbackQuery = '"' + c.name + '" politician official portrait';
+      _doImageSearch(fallbackQuery, candidateId, c, function(url2) {
+        if (url2) _saveAndApply(candidateId, c, url2);
+        // else keep initials — no unreliable image
+      });
+    }
+  });
+}
+
+function _doImageSearch(query, candidateId, c, callback) {
   var url = 'https://www.googleapis.com/customsearch/v1'
     + '?key=' + GOOG_API_KEY
     + '&cx=' + GOOG_CX
     + '&searchType=image'
-    + '&num=3'
+    + '&num=5'
     + '&imgType=face'
     + '&imgSize=medium'
     + '&safe=active'
@@ -4194,147 +4215,71 @@ function fetchPhotoForCandidate(candidateId, c, race) {
     .then(function(r) { return r.json(); })
     .then(function(data) {
       if (data.error) {
-        console.warn('Custom Search API error for ' + c.name + ':', data.error.message);
-        // Fall back to Wikipedia
-        fetchWikipediaPhoto(candidateId, c);
+        console.warn('Custom Search error:', data.error.message);
+        callback(null);
         return;
       }
       if (!data.items || !data.items.length) {
-        console.log('No image results for:', c.name, '— trying Wikipedia');
-        fetchWikipediaPhoto(candidateId, c);
+        callback(null);
         return;
       }
 
-      // Pick best result: prefer .gov, wikipedia, ballotpedia sources
+      // Score each result — trusted sources score highest
       var best = null;
-      var preferred = ['.gov', 'wikipedia.org', 'ballotpedia.org', 'senate.gov', 'house.gov'];
-      for (var i = 0; i < data.items.length; i++) {
-        var item = data.items[i];
-        var link = item.link || '';
-        if (preferred.some(function(p) { return link.indexOf(p) !== -1; })) {
-          best = link;
-          break;
+      var bestScore = -1;
+
+      data.items.forEach(function(item) {
+        var link = (item.link || '').toLowerCase();
+        var score = 0;
+
+        // Score by source trustworthiness
+        if (link.indexOf('house.gov') !== -1)      score += 100;
+        else if (link.indexOf('senate.gov') !== -1) score += 100;
+        else if (link.indexOf('.gov') !== -1)       score += 80;
+        else if (link.indexOf('ballotpedia.org') !== -1) score += 70;
+        else if (link.indexOf('votesmart.org') !== -1)   score += 60;
+        else score += 10; // unknown source — low trust
+
+        // Reject clearly bad images
+        var lower = (item.link || '').toLowerCase();
+        if (/mugshot|arrest|booking|criminal|inmate/.test(lower)) return;
+        if (/flag|logo|seal|map|chart|icon|symbol/.test(lower)) return;
+
+        // Prefer portrait orientation if dimensions available
+        var imgw = item.image && item.image.width;
+        var imgh = item.image && item.image.height;
+        if (imgw && imgh) {
+          if (imgw > imgh * 1.3) score -= 50; // penalize landscape heavily
         }
-      }
-      if (!best) best = data.items[0].link;
 
-      if (best) {
-        console.log('Photo found for', c.name, ':', best.substring(0, 60));
-        _photoCache[candidateId] = best;
-        c.photo_url = best;
-        _applyPhotoToCard(candidateId, best);
-        _applyPhotoToModal(candidateId, best);
+        if (score > bestScore) {
+          bestScore = score;
+          best = item.link;
+        }
+      });
+
+      // Only use result if it's from a trusted source (score >= 60)
+      // If best result is from unknown source, skip it — keep initials
+      if (bestScore >= 60) {
+        callback(best);
+      } else {
+        console.log('No trusted photo source for', c.name, '— keeping initials');
+        callback(null);
       }
     })
     .catch(function(e) {
-      console.log('Custom Search failed for ' + c.name + ', trying Wikipedia:', e.message);
-      fetchWikipediaPhoto(candidateId, c);
+      callback(null);
     });
 }
 
-// Wikipedia REST API fallback — free, no key, works from any domain
-// Uses the Wikipedia search API to find the candidate's page, then gets their photo
-function fetchWikipediaPhoto(candidateId, c) {
-  if (_photoCache[candidateId]) return;
-
-  // Use Wikipedia REST summary API — faster, single call, returns thumbnail directly
-  // Search by exact name first, fall back to "Name politician" if needed
-  var title = c.name.trim().replace(/ /g, '_');
-  var summaryUrl = 'https://en.wikipedia.org/api/rest_v1/page/summary/' + encodeURIComponent(title) + '?origin=*';
-
-  fetch(summaryUrl)
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      // Reject if wrong person (disambiguation or no thumbnail)
-      if (data.type === 'disambiguation') throw new Error('disambiguation');
-      if (!data.thumbnail) throw new Error('no thumbnail');
-
-      var photoUrl = data.originalimage ? data.originalimage.source : data.thumbnail.source;
-      var w = data.originalimage ? data.originalimage.width : data.thumbnail.width;
-      var h = data.originalimage ? data.originalimage.height : data.thumbnail.height;
-
-      // Reject landscape images (mugshots, flags, logos are often landscape)
-      // A headshot should be taller than wide, or at least roughly square
-      if (w && h && w > h * 1.2) throw new Error('landscape image rejected');
-
-      // Reject known bad image patterns
-      var lower = photoUrl.toLowerCase();
-      if (/flag|logo|seal|map|chart|diagram|icon|symbol|badge/.test(lower)) throw new Error('non-portrait image');
-
-      // Use a thumbnail-sized version for cards (400px wide)
-      // Wikipedia original URLs contain /commons/ — resize via thumb URL pattern
-      if (photoUrl.indexOf('/commons/') !== -1 && photoUrl.indexOf('/thumb/') === -1) {
-        // Convert to thumbnail: insert /thumb/ and append size
-        photoUrl = photoUrl.replace('/commons/', '/commons/thumb/') + '/400px-' + photoUrl.split('/').pop();
-      }
-
-      console.log('✓ Wikipedia photo for', c.name, w + 'x' + h);
-      _photoCache[candidateId] = photoUrl;
-      c.photo_url = photoUrl;
-      _applyPhotoToCard(candidateId, photoUrl);
-      _applyPhotoToModal(candidateId, photoUrl);
-    })
-    .catch(function(e) {
-      // First attempt failed — try with "Name politician" search
-      if (e.message !== 'landscape image rejected' && e.message !== 'non-portrait image') {
-        _fetchWikipediaBySearch(candidateId, c);
-      }
-    });
+function _saveAndApply(candidateId, c, photoUrl) {
+  _photoCache[candidateId] = photoUrl;
+  c.photo_url = photoUrl;
+  _applyPhotoToCard(candidateId, photoUrl);
+  _applyPhotoToModal(candidateId, photoUrl);
 }
 
-// Secondary Wikipedia lookup using search API (for names that don't match page titles directly)
-function _fetchWikipediaBySearch(candidateId, c) {
-  if (_photoCache[candidateId]) return;
-
-  var searchUrl = 'https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch='
-    + encodeURIComponent(c.name + ' politician')
-    + '&format=json&origin=*&srlimit=3';
-
-  fetch(searchUrl)
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (!data.query || !data.query.search || !data.query.search.length) return;
-
-      // Try each result — skip disambiguation pages
-      var titles = data.query.search
-        .filter(function(r) { return r.snippet.indexOf('disambiguation') === -1; })
-        .map(function(r) { return r.title; });
-
-      if (!titles.length) return;
-
-      // Get pageimages for the best match with dimensions
-      var thumbUrl = 'https://en.wikipedia.org/w/api.php?action=query&titles='
-        + encodeURIComponent(titles[0])
-        + '&prop=pageimages&pithumbsize=400&pilimit=1&piprop=thumbnail|original&format=json&origin=*';
-
-      return fetch(thumbUrl);
-    })
-    .then(function(r) { return r ? r.json() : null; })
-    .then(function(data) {
-      if (!data) return;
-      var pages = data.query && data.query.pages;
-      if (!pages) return;
-      var page = pages[Object.keys(pages)[0]];
-      if (!page || !page.thumbnail) return;
-
-      var thumb = page.thumbnail;
-      // Reject landscape
-      if (thumb.width && thumb.height && thumb.width > thumb.height * 1.2) return;
-
-      var photoUrl = thumb.source;
-      var lower = photoUrl.toLowerCase();
-      if (/flag|logo|seal|map|chart|diagram|icon|symbol|badge/.test(lower)) return;
-
-      console.log('✓ Wikipedia search photo for', c.name);
-      _photoCache[candidateId] = photoUrl;
-      c.photo_url = photoUrl;
-      _applyPhotoToCard(candidateId, photoUrl);
-      _applyPhotoToModal(candidateId, photoUrl);
-    })
-    .catch(function() {});
-}
-
-// Inject a photo into a rendered grid card
+// Inject photo into a rendered grid card
 function _applyPhotoToCard(candidateId, photoUrl) {
   var cards = document.querySelectorAll('.flip-card');
   cards.forEach(function(card) {
@@ -4342,7 +4287,7 @@ function _applyPhotoToCard(candidateId, photoUrl) {
     if (!oc.includes("'" + candidateId + "'")) return;
     var photoDiv = card.querySelector('.card-photo');
     if (!photoDiv) return;
-    if (photoDiv.querySelector('img')) return; // already has photo
+    if (photoDiv.querySelector('img')) return;
     var initSpan = photoDiv.querySelector('.card-initials');
     var img = document.createElement('img');
     img.src = photoUrl;
@@ -4357,10 +4302,8 @@ function _applyPhotoToCard(candidateId, photoUrl) {
   });
 }
 
-// Inject a photo into the modal if it's open for this candidate
+// Inject photo into modal if open
 function _applyPhotoToModal(candidateId, photoUrl) {
-  var modal = document.getElementById('activeCardModal');
-  if (!modal) return;
   var front = document.getElementById('modalFaceFront');
   if (!front) return;
   var photoDiv = front.querySelector('.modal-photo');
@@ -4375,6 +4318,7 @@ function _applyPhotoToModal(candidateId, photoUrl) {
   img.onerror = function() { this.remove(); };
   photoDiv.insertBefore(img, photoDiv.firstChild);
 }
+
 document.getElementById('zipInput').addEventListener('keydown', e => {
   if (e.key === 'Enter') lookupZip();
 });
